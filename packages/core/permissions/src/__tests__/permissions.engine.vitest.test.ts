@@ -464,6 +464,24 @@ describe('Permissions Engine', () => {
     expect(ability.can('read', 'article', 'name')).toBeFalsy();
   });
 
+  it('combines two object-returning conditions with OR so either query grants access', async () => {
+    // hasId125 returns { id: 125 }, hasId200 returns { id: 200 }
+    // A user whose entry has id 125 OR id 200 should be allowed — not required to satisfy both.
+    const permissions: Permission[] = [
+      {
+        action: 'read',
+        subject: 'article',
+        conditions: ['hasId125', 'hasId200'],
+      },
+    ];
+
+    const { ability } = await buildEngineWithAbility({ permissions });
+
+    expect(ability.can('read', subject('article', { id: 125 }))).toBeTruthy();
+    expect(ability.can('read', subject('article', { id: 200 }))).toBeTruthy();
+    expect(ability.can('read', subject('article', { id: 999 }))).toBeFalsy();
+  });
+
   it('skips a condition whose handler is not a function and denies access instead of throwing', async () => {
     const permissions = [
       {
