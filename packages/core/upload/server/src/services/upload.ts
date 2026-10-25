@@ -199,8 +199,6 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
     fileInfo: FileInfo,
     metas?: Metas
   ): Promise<UploadableFile> {
-    // Prefer detected MIME type from security validation. Treat application/octet-stream as
-    // undeclared so we use detected type when the client sends no real Content-Type.
     const detected = (file as any).detectedMimeType;
     const declared = file.mimetype || '';
     const mimeType =
@@ -251,7 +249,6 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
     opts?: CommonOptions
   ) {
     const { user } = opts ?? {};
-    // create temporary folder to store files for stream manipulation
     const tmpWorkingDirectory = await createAndAssignTmpWorkingDirectoryToFiles(files);
 
     const uploadedFiles = [];
@@ -280,40 +277,28 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
         uploadedFiles.push(...results);
       }
     } finally {
-      // delete temporary folder
       await fse.remove(tmpWorkingDirectory);
     }
 
     return uploadedFiles;
   }
 
-  /**
-   * When uploading an image, an additional thumbnail is generated.
-   * Also, if there are responsive formats defined, another set of images will be generated too.
-   *
-   * @param {*} fileData
-   */
   async function uploadImage(fileData: UploadableFile) {
     const { getDimensions, generateThumbnail, generateResponsiveFormats, isResizableImage } =
       getService('image-manipulation');
 
-    // Store width and height of the original image
     const { width, height } = await getDimensions(fileData);
 
-    // Make sure this is assigned before calling any upload
-    // That way it can mutate the width and height
     _.assign(fileData, {
       width,
       height,
     });
 
-    // For performance reasons, all uploads are wrapped in a single Promise.all
     const uploadThumbnail = async (thumbnailFile: UploadableFile) => {
       await getService('provider').upload(thumbnailFile);
       _.set(fileData, 'formats.thumbnail', thumbnailFile);
     };
 
-    // Generate thumbnail and responsive formats
     const uploadResponsiveFormat = async (format: { key: string; file: UploadableFile }) => {
       const { key, file } = format;
       await getService('provider').upload(file);
@@ -322,10 +307,8 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
 
     const uploadPromises: Promise<void>[] = [];
 
-    // Upload image
     queueConcurrentOperation(uploadPromises, getService('provider').upload(fileData));
 
-    // Generate & Upload thumbnail and responsive formats
     if (await isResizableImage(fileData)) {
       const thumbnailFile = await generateThumbnail(fileData);
       if (thumbnailFile) {
@@ -335,22 +318,14 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
       const formats = await generateResponsiveFormats(fileData);
       if (Array.isArray(formats) && formats.length > 0) {
         for (const format of formats) {
-          // eslint-disable-next-line no-continue
           if (!format) continue;
           queueConcurrentOperation(uploadPromises, uploadResponsiveFormat(format));
         }
       }
     }
-    // Wait for all uploads to finish
     await Promise.all(uploadPromises);
   }
 
-  /**
-   * Like uploadImage, but pairs the main file and each format with its old
-   * counterpart and routes through provider.replace so providers that implement
-   * an atomic replace can use it. Formats that no longer exist on the new image
-   * are deleted; formats that didn't exist on the old image are uploaded fresh.
-   */
   async function replaceImage(fileData: UploadableFile, oldFile: File) {
     const { getDimensions, generateThumbnail, generateResponsiveFormats, isResizableImage } =
       getService('image-manipulation');
@@ -374,7 +349,6 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
 
     const promises: Promise<unknown>[] = [];
 
-    // Replace the main file
     queueConcurrentOperation(promises, getService('provider').replace(fileData, oldFile));
 
     const newFormatKeys = new Set<string>();
@@ -389,7 +363,6 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
       const formats = await generateResponsiveFormats(fileData);
       if (Array.isArray(formats) && formats.length > 0) {
         for (const format of formats) {
-          // eslint-disable-next-line no-continue
           if (!format) continue;
           newFormatKeys.add(format.key);
           queueConcurrentOperation(promises, replaceFormat(format.key, format.file));
@@ -397,7 +370,6 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
       }
     }
 
-    // Delete any formats that existed on the old file but are not present on the new one
     if (
       oldFile.formats &&
       oldFile.provider === strapi.config.get<Config>('plugin::upload').provider
@@ -413,10 +385,6 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
     await Promise.all(promises);
   }
 
-  /**
-   * Upload a file. If it is an image it will generate a thumbnail
-   * and responsive formats (if enabled).
-   */
   async function uploadFileAndPersist(fileData: UploadableFile, opts?: CommonOptions) {
     const { user } = opts ?? {};
 
@@ -433,7 +401,6 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
 
     _.set(fileData, 'provider', config.provider);
 
-    // Persist file(s)
     return add(fileData, { user });
   }
 
@@ -452,11 +419,10 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
 
     const fileService = getService('file');
 
-    // Fields the request does not carry keep the value they have in database.
     const keepStored = <T>(value: T | null | undefined, stored: T): T =>
-      _.isNil(value) ? stored : value;
+      value === undefined ? stored : value;
 
-    const folderHasChanged = !_.isNil(folder) && folder !== dbFile.folder;
+    const folderHasChanged = folder !== undefined && folder !== dbFile.folder;
 
     const newInfos = {
       name: keepStored(name, dbFile.name),
@@ -486,47 +452,31 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
       throw new NotFoundError();
     }
 
-    // create temporary folder to store files for stream manipulation
     const tmpWorkingDirectory = await createAndAssignTmpWorkingDirectoryToFiles(file);
 
     let fileData: UploadableFile;
 
     try {
-      // `refId` / `ref` / `field` are dropped rather than forwarded: `formatFileInfo` turns
-      // them into a one-element `related` array, and a bare array reaches the morph join as
-      // `set` — which deletes every row for this file, detaching it from every other entry
-      // that uses it. Attaching an existing file to an entry is the content API's job.
       const { fileInfo, refId: _refId, ref: _ref, field: _field, ...metas } = data;
       fileData = await enhanceAndValidateFile(file, fileInfo, metas);
 
-      // Replacing a file writes new bytes just like creating one, so it has to
-      // respect sizeLimit too. Checked before any provider write, and measured on
-      // the same post-optimization file as the create path (uploadFileAndPersist).
       await getService('provider').checkFileSize(fileData);
 
-      // keep a constant hash and extension so the file url doesn't change when the file is replaced
       _.assign(fileData, {
         hash: dbFile.hash,
         ext: dbFile.ext,
       });
 
-      // A plain replace sends no folder, so `formatFileInfo` resolved folderPath to
-      // '/' while the relation survived — and folder deletion selects by folderPath,
-      // which orphaned the file. An explicitly sent folder still moves it.
       if (fileInfo?.folder === undefined) {
         _.assign(fileData, { folderPath: dbFile.folderPath });
       }
 
-      // clear old formats — replaceImage / replace will set new ones
       _.set(fileData, 'formats', {});
 
       if (dbFile.provider === config.provider) {
         if (await isImage(fileData)) {
           await replaceImage(fileData, dbFile);
         } else {
-          // The new file is not an image, so it has no formats. Replace the main
-          // file, then delete any formats the old image left behind — otherwise
-          // they're orphaned in storage since the DB record no longer tracks them.
           await getService('provider').replace(fileData, dbFile);
           if (dbFile.formats) {
             await Promise.all(
@@ -537,7 +487,6 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
           }
         }
       } else if (await isImage(fileData)) {
-        // Cross-provider replacement: no delete on the old provider, upload to the new one.
         await uploadImage(fileData);
       } else {
         await getService('provider').upload(fileData);
@@ -545,7 +494,6 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
 
       _.set(fileData, 'provider', config.provider);
     } finally {
-      // delete temporary folder
       await fse.remove(tmpWorkingDirectory);
     }
 
@@ -603,7 +551,6 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
 
     if (!file) return file;
 
-    // Sign file URLs if using private provider
     return fileService.signFileUrls(file);
   }
 
@@ -612,7 +559,6 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
       .query(FILE_MODEL_UID)
       .findMany(strapi.get('query-params').transform(FILE_MODEL_UID, query));
 
-    // Sign file URLs if using private provider
     return async.map(files, (file: File) => fileService.signFileUrls(file));
   }
 
@@ -621,7 +567,6 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
       .query(FILE_MODEL_UID)
       .findPage(strapi.get('query-params').transform(FILE_MODEL_UID, query));
 
-    // Sign file URLs if using private provider
     const signedResults = await async.map(result.results, (file: File) =>
       fileService.signFileUrls(file)
     );
@@ -632,10 +577,6 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
     };
   }
 
-  /**
-   * Resolve whether the count query should run, mirroring core-api's `shouldCount`.
-   * Defaults to the `api.rest.withCount` config (true) when not specified on the request.
-   */
   function resolveWithCount(pagination: Record<string, unknown>): boolean {
     if (has(pagination, 'withCount')) {
       const withCount = pagination.withCount;
@@ -664,23 +605,12 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
     return Boolean(strapi.config.get('api.rest.withCount', true));
   }
 
-  /**
-   * REST-aware paginated find for the content API.
-   *
-   * Unlike `findPage` (used by the admin API), this honors the standard nested
-   * `pagination` query object (`pagination[page]`, `pagination[pageSize]`,
-   * `pagination[start]`, `pagination[limit]`, `pagination[withCount]`) and the
-   * `api.rest.defaultLimit` / `api.rest.maxLimit` / `api.rest.withCount` config,
-   * exactly like every other Strapi REST collection-type endpoint.
-   */
   async function findAndCountPage(query: any = {}) {
     const { pagination = {} } = query;
 
     const defaultLimit = toNumber(strapi.config.get('api.rest.defaultLimit', 25));
     const maxLimit = toNumber(strapi.config.get('api.rest.maxLimit')) || null;
 
-    // Whether the consumer used page-based pagination (default) vs offset-based. Both styles
-    // may be present, so the one that is spelled out completely decides.
     const PAGE_KEYS = ['page', 'pageSize'];
     const OFFSET_KEYS = ['start', 'limit'];
     const countPresent = (keys: string[]) => keys.filter((key) => has(pagination, key)).length;
@@ -691,14 +621,11 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
     const isOffset = offsetKeysUsed === OFFSET_KEYS.length && offsetKeysUsed > pageKeysUsed;
     const isPaged = !isOffset;
 
-    // Resolve start/limit applying defaults and the maxLimit cap.
     const { start, limit } = paginationUtils.withDefaultPagination(pagination, {
       defaults: { offset: { limit: defaultLimit }, page: { pageSize: defaultLimit } },
       maxLimit: maxLimit || -1,
     });
 
-    // Feed the transform the resolved offset/limit so it ignores the nested
-    // `pagination` object (which it cannot read) and applies real bounds.
     const transformed = strapi
       .get('query-params')
       .transform(FILE_MODEL_UID, { ...query, pagination: undefined, start, limit });
@@ -720,7 +647,6 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
 
     return {
       results: signedResults,
-      // Omit total & pageCount when counting is disabled (withCount=false).
       pagination: total == null ? _.omit(paginationInfo, ['total', 'pageCount']) : paginationInfo,
     };
   }
@@ -728,7 +654,6 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
   async function remove(file: File) {
     const config = strapi.config.get<Config>('plugin::upload');
 
-    // execute delete function of the provider
     if (file.provider === config.provider) {
       await strapi.plugin('upload').provider.delete(file);
 
@@ -798,11 +723,6 @@ export default ({ strapi }: { strapi: Core.Strapi }) => {
     setSettings,
     getConfiguration,
     setConfiguration,
-
-    /**
-     * exposed for testing only
-     * @internal
-     */
     _uploadImage: uploadImage,
     _replaceImage: replaceImage,
     _queueConcurrentOperation: queueConcurrentOperation,
